@@ -6,7 +6,7 @@
  * - Motor de Avatares Nativo One UI: 42x42 RGB565 Little-Endian (3528 bytes) procesado con Sharp.
  * - Escudo Anti-Delete persistente.
  */
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, Browsers } = require("@whiskeysockets/baileys");
 const { execFile } = require("child_process");
 const pino = require("pino");
 const http = require("http");
@@ -50,6 +50,7 @@ let myNumber = "";
 let myName = "";
 let myLid = "75798220378356@lid";
 let currentQR = "";
+let rawQR = "";
 let chatsCache = new Map();
 let messagesCache = new Map();
 let agendaMap = new Map();   // JID / LID -> Nombre guardado por el usuario en su agenda (Google Contacts)
@@ -521,7 +522,7 @@ async function startWhatsApp() {
       logger: pino({ level: "silent" }),
       printQRInTerminal: false,
       auth: state,
-      browser: ["EspOS microPC", "Chrome", "20.0.04"],
+      browser: Browsers.ubuntu("Chrome"),
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
       markOnlineOnConnect: true,
@@ -542,20 +543,25 @@ async function startWhatsApp() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      rawQR = qr;
       currentQR = await QRCode.toDataURL(qr, { margin: 2, scale: 7 });
       isConnected = false;
     }
 
-    if (connection === "close") {
+        if (connection === "close") {
       isConnected = false;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log(`[WhatsApp] Conexin cerrada (${statusCode}). Reconectando: ${shouldReconnect}`);
-      if (shouldReconnect) {
-        setTimeout(startWhatsApp, 3000);
-      } else {
+      const isPairingFail = statusCode === 405 || statusCode === 428 || statusCode === 401 || statusCode === DisconnectReason.loggedOut;
+      const shouldReconnect = !isPairingFail;
+      console.log(`[WhatsApp] Conexión cerrada (${statusCode}). Reconectando: ${shouldReconnect}`);
+      if (isPairingFail) {
+        console.log("[WhatsApp] Fallo de vinculación o sesión cerrada. Purgando credenciales para nuevo QR limpio...");
         try { fs.rmSync(authFolder, { recursive: true, force: true }); } catch (e) {}
+        rawQR = "";
+        currentQR = "";
         setTimeout(startWhatsApp, 2000);
+      } else {
+        setTimeout(startWhatsApp, 3000);
       }
     } else if (connection === "open") {
       isConnected = true;
@@ -779,7 +785,8 @@ const server = http.createServer(async (req, res) => {
       conectado: isConnected,
       usuario: myName,
       numero: myNumber,
-      totalChats: chatsCache.size
+      totalChats: chatsCache.size,
+      qr: isConnected ? "" : (rawQR || "")
     }));
   }
 
@@ -799,6 +806,28 @@ const server = http.createServer(async (req, res) => {
     programarGuardadoDisco();
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ ok: true, mensaje: "Cache de mensajes y stickers vaciado con exito (solo 30 ultimos activos)" }));
+  }
+
+  // Endpoint para resetear credenciales corruptas y forzar nuevo QR limpio al instante
+  if ((pathname === "/api/reset_auth" || pathname === "/api/reset") && req.method === "GET") {
+    try {
+      if (sock) {
+        try { sock.end(); } catch (_) {}
+        sock = null;
+      }
+      isConnected = false;
+      rawQR = "";
+      currentQR = "";
+      if (fs.existsSync(authFolder)) {
+        fs.rmSync(authFolder, { recursive: true, force: true });
+      }
+      setTimeout(startWhatsApp, 1000);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, mensaje: "Sesion reiniciada limpiamente. Generando nuevo QR..." }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
   }
 
   if (pathname === "/api/chats" && req.method === "GET") {
@@ -945,6 +974,7 @@ const server = http.createServer(async (req, res) => {
       usuario: myName,
       numero: myNumber,
       totalChats: chatsCache.size,
+      qr: isConnected ? "" : (rawQR || ""),
       chats: list,
       llamadas: callsList
     }));
@@ -1176,6 +1206,16 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Endpoint de Fotos y Portadas de Video One UI: entrega 480x320 RGB565 o JPEG para galeria
+  
+  // Endpoint de QR para vinculacion nativa en pantalla ESP32
+  if (pathname === "/api/qr" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      conectado: isConnected,
+      qr: isConnected ? "" : (rawQR || "")
+    }));
+  }
+
   if (pathname === "/api/foto" && req.method === "GET") {
     const msgId = parsedUrl.query.id;
     const modo = parsedUrl.query.modo || "full"; // "full" (480x320 RGB565) o "jpg" (JPEG para Galería)
