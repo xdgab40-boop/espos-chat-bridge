@@ -126,12 +126,18 @@ function cargarStoreDisco() {
         for (const [k, v] of Object.entries(data.chats)) chatsCache.set(k, v);
       }
       if (data.messages) {
-        const ahoraSeg = Math.floor(Date.now() / 1000);
         for (const [k, v] of Object.entries(data.messages)) {
           if (Array.isArray(v)) {
-            // Solo restaurar mensajes recientes de las ultimas 24 horas para evitar revivir historiales obsoletos
-            const recientes = v.filter(m => (ahoraSeg - (Number(m.timestamp) || 0)) < 86400).slice(-30);
+            const recientes = v.slice(-50);
             if (recientes.length > 0) messagesCache.set(k, recientes);
+          }
+        }
+      }
+      if (data.estados) {
+        const ahoraSeg = Math.floor(Date.now() / 1000);
+        for (const [k, v] of Object.entries(data.estados)) {
+          if (ahoraSeg - (Number(v.timestamp) || 0) < 86400) {
+            estadosMap.set(k, v);
           }
         }
       }
@@ -182,8 +188,14 @@ function programarGuardadoDisco() {
       const msgsFrescos = {};
       for (const [k, v] of messagesCache.entries()) {
         if (Array.isArray(v)) {
-          const filtrados = v.filter(m => (ahoraSeg - (Number(m.timestamp) || 0)) < 86400).slice(-30);
-          if (filtrados.length > 0) msgsFrescos[k] = filtrados;
+          const ultimos = v.slice(-50);
+          if (ultimos.length > 0) msgsFrescos[k] = ultimos;
+        }
+      }
+      const estadosValidos = {};
+      for (const [k, v] of estadosMap.entries()) {
+        if (ahoraSeg - (Number(v.timestamp) || 0) < 86400) {
+          estadosValidos[k] = v;
         }
       }
       const payload = {
@@ -194,6 +206,7 @@ function programarGuardadoDisco() {
         jidToLid: Object.fromEntries(jidToLid.entries()),
         chats: Object.fromEntries(chatsCache.entries()),
         messages: msgsFrescos,
+        estados: estadosValidos,
         rawMedia: Object.fromEntries(Array.from(rawMediaMap.entries()).slice(-100))
       };
       fs.writeFileSync(storeFile, JSON.stringify(payload));
@@ -415,14 +428,18 @@ function procesarEstado(msg, esEnVivo = true) {
     if (innerMsg?.viewOnceMessage?.message) innerMsg = innerMsg.viewOnceMessage.message;
     if (innerMsg?.viewOnceMessageV2?.message) innerMsg = innerMsg.viewOnceMessageV2.message;
 
-    const participant = msg.key?.participant || msg.participant || "";
+    let participant = msg.key?.participant || msg.participant || "";
+    const esPropio = Boolean(msg.key?.fromMe);
+    if (!participant && esPropio) {
+      participant = sock?.user?.id ? jidNormalizedUser(sock.user.id) : (myNumber ? `${myNumber}@s.whatsapp.net` : "me");
+    }
     if (!participant) return;
 
     const alt = lidToJid.get(participant) || jidToLid.get(participant);
-    let autor = contactsMap.get(participant) || (alt ? contactsMap.get(alt) : null) || resolverNombre(participant, "", false);
+    let autor = esPropio ? "Tú" : (contactsMap.get(participant) || (alt ? contactsMap.get(alt) : null) || resolverNombre(participant, "", false));
     if (!autor || autor === "Desconocido") {
-      autor = participant.split("@")[0];
-      if (autor.length >= 8) autor = "+" + autor;
+      autor = esPropio ? "Tú" : participant.split("@")[0];
+      if (autor.length >= 8 && !esPropio) autor = "+" + autor;
     }
 
     const rawTs = msg.messageTimestamp?.low || msg.messageTimestamp || Math.floor(Date.now() / 1000);
@@ -433,14 +450,33 @@ function procesarEstado(msg, esEnVivo = true) {
     let esFoto = false;
     let bgArgb = 0xFF128C7E;
 
+    const safeId = id.replace(/[^a-zA-Z0-9_-]/g, "_");
     if (innerMsg.imageMessage) {
       tipo = "foto";
       esFoto = true;
       texto = innerMsg.imageMessage.caption ? "[Foto] " + innerMsg.imageMessage.caption : "[Foto]";
       rawMediaMap.set(id, msg);
+      if (innerMsg.imageMessage.jpegThumbnail) {
+        try {
+          const jpgPath = path.join(photosFolder, `${safeId}.jpg`);
+          if (!fs.existsSync(jpgPath)) {
+            fs.writeFileSync(jpgPath, Buffer.from(innerMsg.imageMessage.jpegThumbnail));
+          }
+        } catch (_) {}
+      }
     } else if (innerMsg.videoMessage) {
       tipo = "video";
-      texto = innerMsg.videoMessage.caption ? "[Video] " + innerMsg.videoMessage.caption : "[Video]";
+      esFoto = true;
+      texto = innerMsg.videoMessage.caption ? "[Foto] " + innerMsg.videoMessage.caption : "[Foto con musica]";
+      rawMediaMap.set(id, msg);
+      if (innerMsg.videoMessage.jpegThumbnail) {
+        try {
+          const jpgPath = path.join(photosFolder, `${safeId}.jpg`);
+          if (!fs.existsSync(jpgPath)) {
+            fs.writeFileSync(jpgPath, Buffer.from(innerMsg.videoMessage.jpegThumbnail));
+          }
+        } catch (_) {}
+      }
     } else if (innerMsg.extendedTextMessage) {
       tipo = "texto";
       texto = innerMsg.extendedTextMessage.text || "";
@@ -664,7 +700,7 @@ async function startWhatsApp() {
       browser: ["EspOS microPC", "Chrome", "20.0.04"],
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
-      markOnlineOnConnect: true,
+      markOnlineOnConnect: false,
       getMessage: async (key) => {
         if (!key?.id) return undefined;
         // 1. Buscar en el mapa rapido de mensajes completos (por ID)
@@ -685,6 +721,21 @@ async function startWhatsApp() {
       }
     });
 
+    // ESCUDO TOTAL CONTRA FUGAS DE PRESENCIA EN LINEA (Baileys PushName Bug Fix)
+  // Baileys emite un nodo <presence attrs={{ name }} /> sin atributo 'type' en cada evento creds.update (socket.js:564).
+  // WhatsApp interpreta cualquier presencia sin type o con type='available' como 'En linea' (Online 24/7).
+  // Interceptamos sock.sendNode para bloquear cualquier presencia no autorizada:
+  const rawSendNode = sock.sendNode.bind(sock);
+  sock.sendNode = async (node) => {
+    if (node && node.tag === 'presence') {
+      const pType = node.attrs?.type;
+      if (!pType || pType === 'available') {
+        return; // Descartar silenciosamente fugas de presencia online
+      }
+    }
+    return rawSendNode(node);
+  };
+
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
@@ -696,7 +747,7 @@ async function startWhatsApp() {
       isConnected = false;
     }
 
-        if (connection === "close") {
+    if (connection === "close") {
       isConnected = false;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401;
@@ -728,8 +779,38 @@ async function startWhatsApp() {
       }
       console.log(`[WhatsApp] Vinculado exitosamente: ${myName} (${myNumber}) LID: ${myLid}`);
       sincronizarGruposReales();
+      try {
+        const meName = (myName || sock.user?.name || "Gab").replace(/@/g, "");
+        await rawSendNode({
+          tag: 'presence',
+          attrs: {
+            name: meName,
+            type: 'unavailable'
+          }
+        });
+        console.log("[WhatsApp] Modo silencioso activo: presencia offline ('unavailable') forzada con exito.");
+      } catch (pe) {
+        console.warn("[WhatsApp] No se pudo enviar presencia inicial:", pe.message);
+      }
     }
   });
+
+  if (!global.__presenceWatchdog) {
+    global.__presenceWatchdog = setInterval(async () => {
+      try {
+        if (sock && isConnected) {
+          const meName = (myName || sock.user?.name || "Gab").replace(/@/g, "");
+          await rawSendNode({
+            tag: 'presence',
+            attrs: {
+              name: meName,
+              type: 'unavailable'
+            }
+          });
+        }
+      } catch (_) {}
+    }, 5 * 60 * 1000);
+  }
 
   sock.ev.on("messaging-history.set", ({ chats, contacts, messages }) => {
     if (Array.isArray(contacts)) {
@@ -1024,7 +1105,7 @@ const server = http.createServer(async (req, res) => {
     const prekeyFiles = authFiles.filter(f => f.startsWith("pre-key-"));
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
-      version: "2.9.5",
+      version: "3.3.1",
       uptime: Math.round(process.uptime()),
       connected: isConnected,
       myNumber,
@@ -1520,8 +1601,12 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
+      let mediaBuf = null;
+      if (fs.existsSync(jpgPath)) {
+        try { mediaBuf = fs.readFileSync(jpgPath); } catch (_) {}
+      }
       const rawMsg = rawMediaMap.get(msgId);
-      if (!rawMsg) { res.writeHead(404); return res.end("Foto no en memoria"); }
+      if (!mediaBuf && !rawMsg) { res.writeHead(404); return res.end("Foto no en memoria ni en disco"); }
       if (!sharp) { res.writeHead(503); return res.end("Sharp no disponible"); }
 
       let inner = rawMsg.message;
@@ -1530,14 +1615,23 @@ const server = http.createServer(async (req, res) => {
       if (inner?.viewOnceMessageV2?.message) inner = inner.viewOnceMessageV2.message;
       if (inner?.documentWithCaptionMessage?.message) inner = inner.documentWithCaptionMessage.message;
 
-      let mediaBuf = null;
-      if (inner?.videoMessage?.jpegThumbnail) {
+      if (!mediaBuf && inner?.videoMessage?.jpegThumbnail) {
         mediaBuf = Buffer.from(inner.videoMessage.jpegThumbnail);
+      } else if (inner?.imageMessage?.jpegThumbnail && !sock) {
+        mediaBuf = Buffer.from(inner.imageMessage.jpegThumbnail);
       } else {
-        mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
-          logger: pino({ level: "silent" }),
-          reuploadRequest: sock?.updateMediaMessage
-        });
+        try {
+          mediaBuf = await downloadMediaMessage(rawMsg, "buffer", {}, {
+            logger: pino({ level: "silent" }),
+            reuploadRequest: sock?.updateMediaMessage
+          });
+        } catch (e) {
+          if (inner?.videoMessage?.jpegThumbnail) {
+            mediaBuf = Buffer.from(inner.videoMessage.jpegThumbnail);
+          } else if (inner?.imageMessage?.jpegThumbnail) {
+            mediaBuf = Buffer.from(inner.imageMessage.jpegThumbnail);
+          }
+        }
       }
 
       if (!mediaBuf) { res.writeHead(404); return res.end("Descarga fallida"); }
